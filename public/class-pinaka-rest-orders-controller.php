@@ -151,6 +151,328 @@ class Pinaka_REST_Orders_Controller extends WC_REST_Orders_V2_Controller {
 			'permission_callback' => array( $this, 'get_items_permissions_check' )
 			)
 		);
+
+		register_rest_route(
+			$this->namespace,
+			'/' . $this->rest_base . '/issuing-coupons',
+			[
+				[
+					'methods'             => 'POST',
+					'callback'            => [ $this, 'pinaka_issuing_coupons_api' ],
+					'permission_callback' => [ $this, 'get_items_permissions_check' ],
+				],
+			]
+		);
+	}
+
+	public function pinaka_issuing_coupons_api( WP_REST_Request $request ) {
+
+		$params     = $request->get_params();
+		$line_items = $params['line_items'] ?? [];
+
+		if ( empty( $line_items ) ) {
+			return new WP_Error(
+				'pinaka_invalid_line_items',
+				__( 'line_items are required', 'pinaka-pos' ),
+				[ 'status' => 400 ]
+			);
+		}
+
+		/**
+		 * ✅ 1. Calculate order total from line_items subtotal
+		 */
+		$order_total = $this->pinaka_calculate_order_total_from_line_items( $line_items );
+
+		if ( $order_total <= 0 ) {
+			return new WP_Error(
+				'pinaka_invalid_order_total',
+				__( 'Calculated order total is invalid', 'pinaka-pos' ),
+				[ 'status' => 400 ]
+			);
+		}
+
+		/**
+		 * ✅ 2. Create virtual order (NOT saved)
+		 *     Only for product & category validation
+		 */
+		$order = $this->pinaka_create_virtual_order_from_items( $line_items );
+
+		/**
+		 * No real order
+		 */
+		$current_order_id = 0;
+
+		/**
+		 * ✅ 3. Reuse existing coupon validation logic
+		 */
+		$coupons = $this->pinaka_get_all_shop_coupons(
+			$order_total,
+			$current_order_id,
+			$order
+		);
+
+		// Cleanup
+		$order->remove_order_items();
+
+		return rest_ensure_response( [
+			'order_total' => $order_total,
+			'coupons'     => $coupons,
+		] );
+	}
+
+	private function pinaka_calculate_order_total_from_line_items( array $line_items ): float {
+
+		$total = 0.0;
+
+		foreach ( $line_items as $item ) {
+
+			if ( ! isset( $item['subtotal'] ) ) {
+				continue;
+			}
+
+			$total += (float) $item['subtotal'];
+		}
+
+		return round( $total, 2 );
+	}
+
+	private function pinaka_create_virtual_order_from_items( array $line_items ): WC_Order {
+
+		$order = new WC_Order();
+
+		foreach ( $line_items as $item ) {
+
+			if ( empty( $item['product_id'] ) || empty( $item['quantity'] ) ) {
+				continue;
+			}
+
+			$product_id = (int) ( $item['variation_id'] ?? $item['product_id'] );
+			$product    = wc_get_product( $product_id );
+
+			if ( ! $product ) {
+				continue;
+			}
+
+			$order->add_product(
+				$product,
+				(int) $item['quantity']
+			);
+		}
+
+		/**
+		 * ❌ DO NOT SAVE ORDER
+		 */
+
+		return $order;
+	}
+
+
+	private function pinaka_get_all_shop_coupons( float $order_total, int $current_order_id, WC_Order $order ) {
+
+		$coupons = get_posts( [
+			'post_type'      => 'shop_coupon',
+			'post_status'    => 'publish',
+			'posts_per_page' => -1,
+			'meta_query'     => [
+				[
+					'key'   => '_pinaka_enable_generate_coupon',
+					'value' => 'yes',
+				],
+			],
+		] );
+
+		$response = [];
+
+		foreach ( $coupons as $coupon_post ) {
+
+			$coupon = new WC_Coupon( $coupon_post->ID );
+
+			// Order total validation
+			$min_amount = (float) $coupon->get_minimum_amount();
+			$max_amount = (float) $coupon->get_maximum_amount();
+
+			if ( $min_amount > 0 && $order_total < $min_amount ) continue;
+			if ( $max_amount > 0 && $order_total > $max_amount ) continue;
+
+			// Hide expired coupons
+			$expiry = $coupon->get_date_expires();
+			if ( $expiry && $expiry->getTimestamp() < current_time( 'timestamp' ) ) {
+				continue;
+			}
+
+			// ❗ Product & Category validation (WooCommerce-style)
+			if ( ! $this->pinaka_is_coupon_applicable_for_order( $coupon, $order ) ) {
+				continue;
+			}
+
+			// Hide coupon if WooCommerce usage limit reached
+			$usage_limit = $coupon->get_usage_limit();
+			$usage_count = $coupon->get_usage_count();
+
+			if ( $usage_limit && $usage_count >= $usage_limit ) {
+				continue;
+			}
+
+			// Generate config
+			$generate_type  = get_post_meta(
+				$coupon_post->ID,
+				'_pinaka_generate_coupon_type',
+				true
+			);
+
+			$generate_limit = (int) get_post_meta(
+				$coupon_post->ID,
+				'_pinaka_generate_coupon_limit',
+				true
+			);
+
+			$expiry_date = $coupon->get_date_expires();
+
+			// Stop showing after limit reached
+			if ( $generate_type && $generate_limit > 0 ) {
+
+				$shown_count = $this->pinaka_get_coupon_response_count(
+					$coupon_post->ID,
+					$generate_type,
+					$current_order_id
+				);
+
+				if ( $shown_count >= $generate_limit ) {
+					continue;
+				}
+			}
+
+			$response[] = [
+				'id'            => $coupon_post->ID,
+				'code'          => $coupon->get_code(),
+				'discount_type' => $coupon->get_discount_type(),
+				'amount'        => (float) $coupon->get_amount(),
+				'min_amount'    => $min_amount ?: null,
+				'max_amount'    => $max_amount ?: null,
+				'generate_type' => $generate_type ?: null,
+				'generate_limit'=> $generate_limit ?: null,
+				'expiry_date'    => $coupon->get_date_expires() ? $coupon->get_date_expires()->date( 'Y-m-d' ) : null,
+			];
+		}
+
+		return $response;
+	}
+
+	/**
+	 * Check whether a coupon is applicable for a given order
+	 * (Products, Excluded Products, Categories, Excluded Categories)
+	 */
+	private function pinaka_is_coupon_applicable_for_order( WC_Coupon $coupon, WC_Order $order ): bool {
+
+		$order_product_ids  = [];
+		$order_category_ids = [];
+
+		foreach ( $order->get_items() as $item ) {
+
+			if ( ! $item instanceof WC_Order_Item_Product ) {
+				continue;
+			}
+
+			$product_id   = $item->get_product_id();
+			$variation_id = $item->get_variation_id();
+			$pid          = $variation_id ?: $product_id;
+
+			$order_product_ids[] = $pid;
+
+			// ✅ Correct category source (WooCommerce-style)
+			$parent_id     = wp_get_post_parent_id( $pid );
+			$cat_source_id = $parent_id ?: $pid;
+
+			$terms = get_the_terms( $cat_source_id, 'product_cat' );
+			if ( ! empty( $terms ) && ! is_wp_error( $terms ) ) {
+				foreach ( $terms as $term ) {
+					$order_category_ids[] = $term->term_id;
+				}
+			}
+		}
+
+		$order_product_ids  = array_unique( $order_product_ids );
+		$order_category_ids = array_unique( $order_category_ids );
+
+		// Allowed products
+		$allowed_products = $coupon->get_product_ids();
+		if ( ! empty( $allowed_products ) ) {
+			if ( empty( array_intersect( $allowed_products, $order_product_ids ) ) ) {
+				return false;
+			}
+		}
+
+		// Excluded products
+		$excluded_products = $coupon->get_excluded_product_ids();
+		if ( ! empty( array_intersect( $excluded_products, $order_product_ids ) ) ) {
+			return false;
+		}
+
+		// Allowed categories
+		$allowed_categories = $coupon->get_product_categories();
+		if ( ! empty( $allowed_categories ) ) {
+			if ( empty( array_intersect( $allowed_categories, $order_category_ids ) ) ) {
+				return false;
+			}
+		}
+
+		// Excluded categories
+		$excluded_categories = $coupon->get_excluded_product_categories();
+		if ( ! empty( array_intersect( $excluded_categories, $order_category_ids ) ) ) {
+			return false;
+		}
+
+		return true;
+	}
+
+
+	private function pinaka_get_coupon_response_count(int $coupon_id, string $generate_type, int $current_order_id) {
+		$now = current_time( 'timestamp' );
+
+		switch ( $generate_type ) {
+
+			case 'daily':
+				$after = date( 'Y-m-d 00:00:00', $now );
+				break;
+
+			case 'weekly':
+				$after = date(
+					'Y-m-d 00:00:00',
+					strtotime( 'monday this week', $now )
+				);
+				break;
+
+			case 'monthly':
+				$after = date( 'Y-m-01 00:00:00', $now );
+				break;
+
+			case 'yearly':
+				$after = date( 'Y-01-01 00:00:00', $now );
+				break;
+
+			default:
+				return 0;
+		}
+
+		$orders = wc_get_orders( [
+			'status'     => 'completed',
+			'limit'      => -1,
+			'date_query' => [
+				[
+					'after'  => $after,
+					'before' => current_time( 'mysql' ), // ⬅️ IMPORTANT
+				],
+			],
+			'exclude'    => [ $current_order_id ], // ⬅️ KEY FIX
+			'meta_query' => [
+				[
+					'key'   => '_pinaka_coupon_response_shown_' . $coupon_id,
+					'value' => 'yes',
+				],
+			],
+		] );
+
+		return count( $orders );
 	}
 
 	/**
@@ -1490,6 +1812,12 @@ WHERE
 	protected function save_object( $request, $creating = false ) {
 		try {
 			$pos_order_tag =  $this->get_meta_value( (array) $request->get_param( 'meta_data' ), 'pos_order_tag' );
+			/* ======================================================
+			* PRELOAD OPTIONS (CACHE)
+			* ====================================================== */
+			$payout_product_id   = (int) get_option( 'pinaka_payout_product_id', 0 );
+			$cashback_product_id = (int) get_option( 'pinaka_cashback_product_id', 0 );
+			$discount_product_id = (int) get_option( 'pinaka_discount_product_id', 0 );
 
 			if ( $pos_order_tag === 'updated_from_pos' ) {
 				$order = wc_get_order( $request['id'] );
@@ -1536,12 +1864,35 @@ WHERE
 			} else {
 				// If items have changed, recalculate order totals.
 				if ( isset( $request['billing'] ) || isset( $request['shipping'] ) || isset( $request['line_items'] ) || isset( $request['shipping_lines'] ) || isset( $request['fee_lines'] ) || isset( $request['coupon_lines'] ) ) {
+					// 1) Re-apply/clean existing payout/discount lines and get recovered amounts
 					$object->calculate_totals( true );
 				}
 			}
-
-			// Set coupons.
+			$recovered_amount          = $this->pinaka_remove_existing_payout_lines( $object );
+					
+			$recovered_amount_discount = $this->pinaka_remove_existing_discount_lines( $object );
+			
 			$this->calculate_coupons( $request, $object );
+			if ( $recovered_amount ) {
+				if ( $payout_product_id && $p = wc_get_product( $payout_product_id ) ) {
+					$object->add_product( $p, 1, [
+						'subtotal' => $recovered_amount,
+						'total'    => $recovered_amount,
+					] );
+				}
+			}
+
+			if ( $recovered_amount_discount ) {
+				if ( $discount_product_id && $p = wc_get_product( $discount_product_id ) ) {
+					$object->add_product( $p, 1, [
+						'subtotal' => $recovered_amount_discount,
+						'total'    => $recovered_amount_discount,
+					] );
+				}
+			}
+			$object->calculate_totals( true );
+			// Set coupons.
+			// $this->calculate_coupons( $request, $object );
 
 			/**
 			 * Adds custom order statuses to the WooCommerce order status dropdown menu.
@@ -3392,7 +3743,6 @@ WHERE
 				return $meta['value'];
 			}
 		}
-
 		return [];
 	}
 
@@ -3418,7 +3768,7 @@ WHERE
 			update_post_meta( $post_id, '_payment_user_id', get_current_user_id() );
 			update_post_meta( $post_id, '_payment_datetime', isset( $payment['created_at'] ) ? sanitize_text_field( $payment['created_at'] ) : '' );
 			update_post_meta( $post_id, '_payment_transaction_id', isset( $payment['transaction_id'] ) ? sanitize_text_field( $payment['transaction_id'] ) : '' );
-		
+			update_post_meta( $post_id, '_payment_remaining_change', isset( $payment['remaining'] ) ? floatval( $payment['remaining'] ) : 0 ); 
 			if ( $payment['status'] === 'completed' || $payment['status'] === 'pending') {
 				$total += (float) $payment['amount'];
 			}
@@ -3428,28 +3778,91 @@ WHERE
 	}
 
 	protected function determine_order_status_from_payments( WC_Order $order, array $payments, int $shift_id = 0 ) {
-
+	
 		$order_total   = (float) $order->get_total();
 		$order_id 	= $order->get_id();
 		$paid_amount   = (float) $this->get_completed_payment_total( $payments, $order_id, $shift_id );
+		$has_sale_items   = false;
+		$has_payout_items = false;
 
-		// No payment at all
-		if ( $paid_amount <= 0 ) {
-			return 'pending';
+		$payout_product_id = (int) get_option( 'pinaka_payout_product_id', 0 );
+
+		foreach ( $order->get_items( 'line_item' ) as $item ) {
+
+			if (
+				( $payout_product_id && $item->get_product_id() == $payout_product_id ) ||
+				( (float) $item->get_total() < 0 )
+			) {
+				$has_payout_items = true;
+				continue;
+			}
+
+			if ( (float) $item->get_total() > 0 ) {
+				$has_sale_items = true;
+			}
 		}
 
-		// Partial payment
-		if ( $paid_amount < $order_total ) {
-			return 'pending';
+		$is_payout_only = $has_payout_items && ! $has_sale_items;
+		if($is_payout_only)
+		{
+			$order->payment_complete();
+			$order->update_status(
+				'completed',
+				__( 'Payout-only order. No customer payment required.', 'pinaka-pos' )
+			);
+			$order->save();
+			$paid_amount = $order_total;
+			$logger  = wc_get_logger();
+			$context = [
+				'source'   => 'pinaka-payout-debug',
+				'order_id' => $order->get_id(),
+			];
+
+			$logger->info(
+				sprintf(
+					'Payout-only order completed | Paid Amount: %s | Order Total: %s',
+					wc_format_decimal( $paid_amount ),
+					wc_format_decimal( $order_total )
+				),
+				$context
+			);
+			return $order->get_status();
 		}
 
-		// Fully paid
-		if ( $paid_amount >= $order_total ) {
-			return 'completed'; // or 'completed'
-		}
+		return $this->determine_order_status_from_payments_test($payments);
 
-		return $order->get_status();
 	}
 
+	private function determine_order_status_from_payments_test($pos_payments)
+	{
+		$has_pending = false;
+		$has_voided  = false;
+
+		foreach ($pos_payments as $payment) {
+
+			if ($payment['status'] === 'completed') {
+				return 'completed'; // Highest priority
+			}
+
+			if ($payment['status'] === 'pending') {
+				$has_pending = true;
+			}
+
+			if ($payment['status'] === 'voided') {
+				$has_voided = true;
+			}
+		}
+
+		// If no completed found
+		if ($has_pending) {
+			return 'pending';
+		}
+
+		if ($has_voided) {
+			return 'voided';
+		}
+
+		return 'pending'; // default fallback
+	}
 
 }	
