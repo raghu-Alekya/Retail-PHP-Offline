@@ -687,34 +687,7 @@ class Pinaka_REST_Orders_Controller extends WC_REST_Orders_V2_Controller {
 					}, $fee->get_meta_data()),
 				];
 			}
-			
-			$formatted_order = [
-				'id'              => $pos_client_id ? (int)$pos_client_id : $order_id,
-				'woo_order_id'     => $order_id,
-				'status'               => $order->get_status(),
-				"date_created" 		   => $order->get_date_created()->date('Y-m-d H:i:s'),
-				"date_modified"		   => $order->get_date_modified()->date('Y-m-d H:i:s'),
-				'currency'             => $order->get_currency(),
-				'prices_include_tax'   => $order->get_prices_include_tax(),
-				'discount_total'       => '0.00',
-				'discount_tax'         => '0.00',
-				'shipping_total'       => $order->get_shipping_total(),
-				'shipping_tax'         => $order->get_shipping_tax(),
-				'cart_tax'             => $order->get_cart_tax(),
-				'total'                => $order->get_total(),
-				'total_tax'            => $order->get_total_tax(),
-				'order_key'            => $order->get_order_key(),
-				'payment_method'       => $order->get_payment_method(),
-				'payment_method_title' => $order->get_payment_method_title(),
-				'transaction_id'       => $order->get_transaction_id(),
-				'created_via'          => $order->get_created_via(),
-				'author'			   => $order->get_meta( '_wc_order_created_by' ),
-				'currency'                 => esc_attr( get_woocommerce_currency() ),
-				'currency_symbol'          => get_option("currency_symbol"), // e.g., '₹'
-				'date_completed'       => $order->get_date_completed() ? $order->get_date_completed()->date('c') : null,
-				'date_paid'            => $order->get_date_paid() ? $order->get_date_paid()->date('c') : null,
-				'number'               => $order->get_order_number(),
-				'coupon_lines' => array_values( array_filter( array_map( function ( $item ) {
+			$coupons  = array_values( array_filter( array_map( function ( $item ) {
 					$coupon_code = $item->get_code();
 
 					// get coupon post ID quickly (no expensive WC_Coupon object yet)
@@ -749,8 +722,34 @@ class Pinaka_REST_Orders_Controller extends WC_REST_Orders_V2_Controller {
 						'nominal_amount'=> floatval( $item->get_discount() ),
 						'free_shipping' => (bool) $coupon->get_free_shipping(),
 					];
-				}, $order->get_items( 'coupon' ) ), 'is_array' ) ), // keep only non-null results
-
+				}, $order->get_items( 'coupon' ) ), 'is_array' ) );
+			$formatted_order = [
+				'id'              => $pos_client_id ? (int)$pos_client_id : $order_id,
+				'woo_order_id'     => $order_id,
+				'status'               => $order->get_status(),
+				"date_created" 		   => $order->get_date_created()->date('Y-m-d H:i:s'),
+				"date_modified"		   => $order->get_date_modified()->date('Y-m-d H:i:s'),
+				'currency'             => $order->get_currency(),
+				'prices_include_tax'   => $order->get_prices_include_tax(),
+				'discount_total'       => $coupons ? $order->get_discount_total() : '0.00',
+				'discount_tax'         => $coupons ? $order->get_discount_tax() : '0.00',
+				'shipping_total'       => $order->get_shipping_total(),
+				'shipping_tax'         => $order->get_shipping_tax(),
+				'cart_tax'             => $order->get_cart_tax(),
+				'total'                => $order->get_total(),
+				'total_tax'            => $order->get_total_tax(),
+				'order_key'            => $order->get_order_key(),
+				'payment_method'       => $order->get_payment_method(),
+				'payment_method_title' => $order->get_payment_method_title(),
+				'transaction_id'       => $order->get_transaction_id(),
+				'created_via'          => $order->get_created_via(),
+				'author'			   => $order->get_meta( '_wc_order_created_by' ),
+				'currency'                 => esc_attr( get_woocommerce_currency() ),
+				'currency_symbol'          => get_option("currency_symbol"), // e.g., '₹'
+				'date_completed'       => $order->get_date_completed() ? $order->get_date_completed()->date('c') : null,
+				'date_paid'            => $order->get_date_paid() ? $order->get_date_paid()->date('c') : null,
+				'number'               => $order->get_order_number(),
+				'coupon_lines' 			=> $coupons, // keep only non-null results
 				'line_items'           => $line_items,
 				'fee_lines'            => $fee_lines,
 				'refunds'              => $order->get_refunds(),
@@ -3747,19 +3746,19 @@ WHERE
 	}
 
 	protected function get_completed_payment_total( array $payments, int $order_id, int $shift_id = 0 ): float {
+
 		$total = 0;
 
 		foreach ( $payments as $payment ) {
-			//insert payments in paymet post type
-			// Create the Payment post
+
+			// --- KEEP YOUR ORIGINAL INSERT LOGIC ---
 			$post_id = wp_insert_post( array(
-				'post_title' => isset( $payment['title'] ) ? sanitize_text_field( $payment['title'] ) : 'Payment for Order ' . $order_id,
+				'post_title'   => isset( $payment['title'] ) ? sanitize_text_field( $payment['title'] ) : 'Payment for Order ' . $order_id,
 				'post_content' => '',
 				'post_type'    => 'payments',
 				'post_status'  => 'publish',
 			) );
 
-			// Add meta data to the Payment post
 			update_post_meta( $post_id, '_payment_order_id', $order_id );
 			update_post_meta( $post_id, '_payment_method', isset( $payment['method'] ) ? sanitize_text_field( $payment['method'] ) : 'unknown' );
 			update_post_meta( $post_id, '_payment_amount', isset( $payment['amount'] ) ? floatval( $payment['amount'] ) : 0 );
@@ -3768,14 +3767,32 @@ WHERE
 			update_post_meta( $post_id, '_payment_user_id', get_current_user_id() );
 			update_post_meta( $post_id, '_payment_datetime', isset( $payment['created_at'] ) ? sanitize_text_field( $payment['created_at'] ) : '' );
 			update_post_meta( $post_id, '_payment_transaction_id', isset( $payment['transaction_id'] ) ? sanitize_text_field( $payment['transaction_id'] ) : '' );
-			update_post_meta( $post_id, '_payment_remaining_change', isset( $payment['remaining'] ) ? floatval( $payment['remaining'] ) : 0 ); 
-			if ( $payment['status'] === 'completed' || $payment['status'] === 'pending') {
+
+			// --- KEEP YOUR SUM LOGIC ---
+			if ( $payment['status'] === 'completed' || $payment['status'] === 'pending' ) {
 				$total += (float) $payment['amount'];
 			}
 		}
 
+		// ✅ NEW: Limit total to order total
+		$order       = wc_get_order( $order_id );
+		$order_total = (float) $order->get_total();
+
+		$change = 0;
+
+		if ( $total > $order_total ) {
+			$change = $total - $order_total;
+			$total  = $order_total; // Only apply order amount
+		}
+
+		// Save change separately (optional)
+		if ( $change > 0 ) {
+			update_post_meta( $post_id, '_pos_change_returned', wc_format_decimal( $change ) );
+		}
+
 		return wc_format_decimal( $total );
 	}
+
 
 	protected function determine_order_status_from_payments( WC_Order $order, array $payments, int $shift_id = 0 ) {
 	

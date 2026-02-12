@@ -661,7 +661,7 @@ class Pinaka_Shifts_Api_Controller {
 		$total = 0;
 		foreach ( $payments as $payment ) {
 			$amount  = floatval( get_post_meta( $payment->ID, '_payment_amount', true ) );
-			$change  = floatval( get_post_meta( $payment->ID, '_payment_remaining_change', true ) );
+			$change  = floatval( get_post_meta( $payment->ID, '_pos_change_returned', true ) );
 
 			$total += ( $amount - $change );
 		}

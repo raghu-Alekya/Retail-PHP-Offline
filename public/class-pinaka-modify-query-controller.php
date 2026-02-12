@@ -847,7 +847,24 @@ WHERE
 			$response->data['customer_gstin'] = $customer_gstin;
 		}
 
-		// Rebuild line items with product + variation data
+		$order_id = isset( $response->data['id'] ) ? $response->data['id'] : 0;
+
+		if ( $order_id ) {
+			$order = wc_get_order( $order_id );
+
+			if ( $order ) {
+				$response->data['discount_total'] = wc_format_decimal( $order->get_discount_total(), 2 );
+				$response->data['discount_tax']   = wc_format_decimal( $order->get_discount_tax(), 2 );
+			} else {
+				$response->data['discount_total'] = '0.00';
+				$response->data['discount_tax']   = '0.00';
+			}
+		} else {
+			$response->data['discount_total'] = '0.00';
+			$response->data['discount_tax']   = '0.00';
+		}
+
+ 		// Rebuild line items with product + variation data
 		if ( ! empty( $response->data['line_items'] ) ) {
 			foreach ( $response->data['line_items'] as $item ) {
 				$product_id   = $item['product_id'];
@@ -870,24 +887,6 @@ WHERE
 			}
 			$response->data['line_items'] = $line_items;
 		}
-
-		// 🔥 Remove internal coupons
-		if ( ! empty( $response->data['coupon_lines'] ) ) {
-			$filtered_coupons = array();
-
-			foreach ( $response->data['coupon_lines'] as $coupon_line ) {
-				$coupon_id   = wc_get_coupon_id_by_code( $coupon_line['code'] );
-				$is_internal = get_post_meta( $coupon_id, '_is_internal_coupon', true );
-
-				// Keep only non-internal coupons
-				if ( $is_internal !== 'yes' ) {
-					$filtered_coupons[] = $coupon_line;
-				}
-			}
-
-			$response->data['coupon_lines'] = $filtered_coupons;
-		}
-
 		return $response;
 	}
 
